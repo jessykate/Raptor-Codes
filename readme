@@ -1,0 +1,20 @@
+"draft" python code exploring rateless erasure codes. 
+
+encoding: 
+- Random binary LT codes, 
+
+decoding: 
+- gaussian elimination 
+- BP decoding
+
+todo:
+- LT code with robust soliton distribution
+- "Raptorized" version  with LDPC + Hamming for precodes
+- R10 distribution
+
+requires numpy and bitarray modules. 
+
+numpy is kind of a nightmare, and i probably wouldnt use it again/might get
+rid of it if i keep working on this code. 
+
+
