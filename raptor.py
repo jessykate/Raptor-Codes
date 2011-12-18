@@ -22,46 +22,30 @@ Kmin = 1024
 W = 1024
 
 
-def precode_identity(symbols):
-	# does nothing - takes a list of symbols and returns the same list
-	return symbols
-
-def distribution_random_LT(num_symbols):
-	# return a vector of coefficient indices sampled from the contained
-	# distribution. example return value: [17,22,238]
-
-	# sample a weight from uniform distribution
-	d = numpy.random.random_integers(1, num_symbols)
-
-	# construct a vector of d coefficient indices from k. (sampling without
-	# replacement. 
-	v = random.sample(range(num_symbols),d)
-	return v
-
 
 # one raptor manager is used per object
 class RaptorManager:
 	def __init__(self, filename, K=1024, debug=True):
-		# XXX Currently assumes a string...
 		self.debug = debug
 		self.f = open(filename, 'rb')
 		# number of symbols in each source block
 		self.K = K
-		# keep a counter blocks get sent out. 
+		# keep a counter of how many blocks get sent out. 
 		self.current_block = 0
-		# remember how much padding the last block used (not sure we care about
-		# this)
+		# remember how much padding the last block used 
 		self.padding_last = None
 		self.last_block = False
-
+		# constraint matrix for codes that use pre-coding.
+		self.G = None
 		if self.debug:
 			print "registered " +self.f.name+ "."
 	
 	def _encode_binary_block(self):
 		# encode a chunk of size k from the input file as binary and return
 
-		# each character is 8 bits, so divide K by 8 to keep num symbols (bits)
-		# commensurate with K. 
+		# the file read() method reads in 1-byte (8 bit) chunks, so make sure K
+		# is a multiple of 8, and then divide K by 8 to determine how many bits
+		# to read, to keep num symbols (bits) equal to  K. 
 		if self.K % 8 != 0:
 			sys.stderr.write("error: K must be a byte multiple (ie multiple of 8).")
 			return
@@ -73,7 +57,7 @@ class RaptorManager:
 			block.fromfile(self.f,n)
 		except EOFError:
 			# if we reach the end of the file, get just the remaining bytes and
-			# pad the block as appropriate
+			# pad the block as necessary
 			end_pos = self.f.tell()
 			remaining_bytes = end_pos - start_pos
 			self.f.seek(start_pos)
@@ -86,6 +70,32 @@ class RaptorManager:
 		assert len(block) == self.K
 		return block
 	
+	def generate_constraint_matrix(self, c, d):
+		# c is the number of constraint symbols.
+		# d is the density (remember LDPC is LOW density)
+		# construct a k x n matrix, where n = (k+c)
+		assert (0 < d < 1)
+		n = self.K + c
+		print "n = %d" % n
+		# given the size k x n, calculate the number of bits to make into 1s
+		# for the constraint matrix G. 
+		num_ones = int(n*self.K*d)
+		print "num ones = %d" % num_ones
+		# build G as long vector at first so it's easier to address specific
+		# bits, we'll reshape it below. 
+		G = numpy.zeros(self.K*n, int)
+		print "G matrix:"
+		print G
+		one_indices = random.sample(xrange(self.K*n), num_ones)
+		G[one_indices] = 1
+		G.shape = (self.K,n)
+		# both the encoder and deocder need to know G
+		self.G = G
+		return G
+
+	def get_constraint_matrix(self):
+		return self.G
+
 	def num_bits(self, block):
 		# block is a bitarray object, which packs bits into longs. so number of
 		# bits is the size in bytes * 8. 
@@ -101,22 +111,53 @@ class RaptorManager:
 		return the_block
 
 class RaptorEncoder:
-	def __init__(self, precode, distribution, block, symb_size=1, debug=True):
+	def __init__(self, block, G=None, symb_size=1, debug=True):
 		# precode and distribution are each function variables
 		self.debug = debug
-		self.precode_fn = precode 
-		self.distribution_fn = distribution
 		# symbols is a bitarray()
 		self.symbols = block
+		# generate matrix for pre-code, if any
+		self.G = numpy.asmatrix(G)
 		if self.debug: print "block has %d symbols"% len(self.symbols)
 		# precoded is a bitarray()
-		self.precoded = []
+		self.intermediate = None
 
-	def precode(self):
-		# precode function adds redundancy to the source symbols. happens
-		# once per block, no matter how many output symbols are generated. 
-		self.precoded = self.precode_fn(self.symbols)
-		if self.debug: print '%d precoding symbols' % len(self.precoded)
+	def ldpc_precode(self):
+		# NOTE: generate_constraint_matrix() must be called first. this method
+		# does not call it so that the same generator matrix can be re-used
+		# when desired (eg. to create replicable results)
+
+		# convert symbols to a numpy array for matrix multiplication
+		G_rows, G_cols = self.G.shape
+		print "symbols"
+		print self.symbols
+		k = numpy.array([self.symbols.tolist()])
+		print "precoding with generator matrix."
+		print self.G
+		print "initial symbols"
+		print k
+		print k.shape
+		print self.G.shape
+		intermediate = numpy.asarray(k*self.G)[0,:]
+		print "intermediate symbols:"
+		print intermediate.shape
+		print intermediate
+		assert intermediate.shape == (G_cols,)
+		# return as bitarray
+		self.intermediate = intermediate
+		return bitarray(intermediate.tolist())
+	
+	def distribution_random_LT(self, num_symbols):
+		# return a vector of coefficient indices sampled from the contained
+		# distribution. example return value: [17,22,238]
+
+		# sample a weight from uniform distribution
+		d = numpy.random.random_integers(1, num_symbols)
+
+		# construct a vector of d coefficient indices from k. (sampling without
+		# replacement. 
+		v = random.sample(range(num_symbols),d)
+		return v
 
 	def generate_encoded(self):
 
@@ -124,11 +165,13 @@ class RaptorEncoder:
 		# operating over, and return a vector of coefficients indices,
 		# sampled according to the distribution therein.
 		# example output for 10 precoded symbols: [2,4,9]
-		v = self.distribution_fn(len(self.precoded))
+		print self.intermediate
+		print len(self.intermediate)
+		v = self.distribution_random_LT(len(self.intermediate))
 
 		# grab the symbols at the index positions that have a 1 in the
 		# coefficient vector.
-		selected_symbols = [self.precoded[idx] for idx in v]
+		selected_symbols = [self.intermediate[idx] for idx in v]
 
 		# get the first two values to start the xor process (note this actually
 		# removes the values from selected_symbols, so after the for loop below
@@ -153,6 +196,9 @@ class RaptorGaussDecoder:
 		self.blocks_received = 0
 
 	def add_block(self, encoded):
+		# increment number of blocks received either way
+		self.blocks_received += 1
+
 		val = bool(encoded['val'])
 		coeff = encoded['coefficients']
 		
@@ -165,16 +211,56 @@ class RaptorGaussDecoder:
 			if i > max(coeff):
 				break
 
-		# add the new row to the bottom
-		if not len(self.A):
-			self.A = numpy.array(new_row.tolist())
-		else:
-			self.A = numpy.vstack((self.A, numpy.array(new_row.tolist())))
-		self.b = numpy.append(self.b, val)
-		self.blocks_received += 1
+		# compare it to the ones we've already received:
+		print "A is..."
+		print self.A
+		print "new row is..."
+		print new_row
+		duplicate = False
+		for row in self.A:
+			if numpy.all(row == new_row):
+				print "duplicate row, discarding..."
+				duplicate = True
+				break
+
+		if not duplicate:
+			print "not a duplicate, adding row."
+			# add the new row to the bottom
+			if not len(self.A):
+				self.A = numpy.array(new_row.tolist())
+			else:
+				self.A = numpy.vstack((self.A, numpy.array(new_row.tolist())))
+			self.b = numpy.append(self.b, val)
+		#raw_input()
 
 	def is_full_rank(self):
-		return (numpy.linalg.matrix_rank(self.A) == self.K)
+		print "checking rank for current matrices [A b]"
+		if self.A.size == 0:
+			return False
+
+		b = numpy.array([self.b])
+		print b.shape
+		print self.A.shape
+		both = numpy.hstack((self.A,b.T))
+		rank_ab = numpy.linalg.matrix_rank(both)
+		rank_a = numpy.linalg.matrix_rank(self.A)
+		print "rank_ab = %d and rank_a = %d" % (rank_ab, rank_a)
+
+
+		# print out list versions to copy over to matlab for sanity checking.
+		A = self.A.copy()
+		A = A.tolist()
+		intA = []
+		for row in A:
+			intArow = [int(a) for a in row]
+			intA.append(intArow)
+		print intA
+		intb = [int(bb) for bb in self.b.tolist()]
+		print intb
+
+		if (rank_ab > rank_a) or (rank_ab < self.K):
+			return False
+		return True
 
 	def get_rank(self):
 		return numpy.linalg.matrix_rank(self.A)
@@ -223,14 +309,16 @@ class RaptorGaussDecoder:
 	def _backsub(self, tri, b):
 		mat = numpy.hstack((tri, numpy.array([b]).T))
 		rows, cols = tri.shape
-		soln = numpy.ones(cols, int)
+		soln = numpy.zeros(cols, int)
+		# initialize solution vector with RHS of last row
 		for i in (xrange(cols)).__reversed__():
-			terms = numpy.logical_and(soln[i:cols],mat[i,i:cols]) 
-			# if we successively xor terms with the RHS, we should get the new term
-			rhs = mat[i,1]
-			for t in terms:
-				rhs = rhs ^ t
-			soln[i] = rhs
+			# the reason for the second term being 1 is that the row in
+			# question always has a 1 at the diagonal
+			#inner_term = (sum(mat[i,i:cols] * soln[i:cols]) + mat[i,1]) % 2
+			inner_term = (numpy.dot(mat[i,i:cols],soln[i:cols]) + mat[i,-1]) % 2
+			print "inner term mod 2"
+			print inner_term
+			soln[i] = numpy.logical_and(inner_term, 1)
 			print "soln for x" + str(i)+" = " + str(soln[i])
 
 		# verify solution:
@@ -238,12 +326,13 @@ class RaptorGaussDecoder:
 		print "computed solution:"
 		print soln
 
-
 	def _triangularize(self, mat):
 
 		#mat = self.remove_null_rows(mat)
 		#mat = self.remove_duplicate_rows(mat)
+		print "starting triangularize..."
 		rows, cols = mat.shape
+		print mat
 		# we tacked the solution vector onto the end of the matrix, so don't
 		# count it in terms of the number of columns to iterate over. 
 		cols = cols -1
@@ -256,7 +345,7 @@ class RaptorGaussDecoder:
 			# second column, go from 2.. rows, etc)
 			col_vals = mat[c:rows,c]
 			if col_vals.max() == 0:
-				print "error: below row/column (%d, %d) matrix is singular." % (c,c)
+				print "error: all zeros below row/column (%d, %d). multiple solutions." % (c,c)
 				print mat[c:rows, c:rows]
 				return None
 			# find first row with a 1 in the left-most column (non-zero returns
@@ -268,8 +357,8 @@ class RaptorGaussDecoder:
 			# the current row already has a one, then we're not going to get
 			# any better). 
 			if not (max_i+c) == c:
-				upper_row = mat[c,:]
-				lower_row = mat[c+max_i,:]
+				upper_row = mat[c,:].copy()
+				lower_row = mat[c+max_i,:].copy()
 				mat[c,:] = lower_row
 				mat[c+max_i,:] = upper_row
 
@@ -289,6 +378,8 @@ class RaptorGaussDecoder:
 		# now we can get rid of the dangling rows since our solution is
 		# uniquely specified by the top square component. 
 		mat = mat[0:cols,:]
+		print "rank is now"
+		print numpy.linalg.matrix_rank(mat)
 
 		return mat[:, 0:cols], mat[:, -1]
 
@@ -311,22 +402,45 @@ class RaptorGaussDecoder:
 
 class RaptorBPDecoder:
 	
-	def __init__(self, K):
+	def __init__(self, K, G=None):
+		# num symbols per block
 		self.K = K
+		# constraint matrix
+		self.G = G
+		self.constraint_symbols = self.G.shape[1] - self.K
+		# BP decoder bookkeeping
 		self.symbols_processed = 0
 		self.known_symbols = {}
 		self.waiting_symbols = []
+
+	def de_precode(self, intermediate):
+		# if pre-coding was used, then the symbols decoded by the BP decoder
+		# include redundant 'constraint' symbols that we need to remove to get
+		# back the original source symbols. 
+
+		# make a matrix out of the remaining waiting symbols
+		# we know that x*G = int, and int*A = y ==> x*G*A = y.
+		# so x = y*A_inv*G_inv
+		# we have G and y (all the vals) and A (coeffs)
+
+		# use gauss elimination to find multiplication of G with
+		pass
+
+
 
 	def bp_decode(self, block):
 		self.symbols_processed += 1
 		val = bool(block['val'])
 		coeffs = block['coefficients']
-		print "coeffs"
-		print coeffs
 		if len(coeffs) > 1:
 			self.reduce(coeffs, val)	
 		if len(coeffs) == 1:
 			self.process_degree_one(coeffs, val)
+
+		if self.symbols_processed >= self.K + self.constraint_symbols:
+			# then we should have enough symbols to decode using the precode
+
+
 
 		if len(self.known_symbols) == self.K:
 			print self.known_symbols
@@ -399,8 +513,7 @@ def run_gauss(filename):
 		print "retrieved block... "
 		print block
 	# this encoder is non-systematic, uses no pre-code. 
-	encoder = RaptorEncoder(precode_identity, distribution_random_LT, block)
-	encoder.precode()
+	encoder = RaptorEncoder(block)
 	decoder = RaptorGaussDecoder(K)
 
 	# grab new symbols and periodically check to see if we've gathered enough
@@ -427,6 +540,7 @@ def run_bp(filename):
 	K = 8
 	epsilon = int(0.5*8)
 	manager = RaptorManager(filename, K)
+	G = manager.generate_constraint_matrix(c=3,d=0.2)
 
 	decoded_blocks = []
 	total_overhead = 0
@@ -437,9 +551,9 @@ def run_bp(filename):
 		# this encoder is non-systematic, uses no pre-code. 
 		# XXX it's also weird that there's one encoder per block but one
 		# manager and decoder per message. fix. 
-		encoder = RaptorEncoder(precode_identity, distribution_random_LT, block)
-		decoder = RaptorBPDecoder(K)
-		encoder.precode()
+		encoder = RaptorEncoder(block,G)
+		decoder = RaptorBPDecoder(K, G)
+		intermediate = encoder.ldpc_precode()
 
 		original_symbols = False
 		while not original_symbols:
@@ -449,10 +563,10 @@ def run_bp(filename):
 			original_symbols = decoder.bp_decode(e)
 		print block
 		print "%d symbols processed for this block for %d source symbols." % (decoder.symbols_processed, K)
-		total_overhead = decoder.symbols_processed
 		decoded_blocks.append(original_symbols)
 		block = manager.next_block()
 	
+	total_overhead = decoder.symbols_processed
 	print "decoder processed %d blocks with %f%% average overhead" % (len(decoded_blocks), 100*total_overhead/float(len(decoded_blocks)))
 	print "original message was"
 	print decoded_blocks
@@ -465,8 +579,8 @@ if __name__ == '__main__':
 		sys.stderr.write("Usage: ./raptor filename")
 		sys.exit(1)
 	filename = sys.argv[1]
-	run_gauss(filename)
-	#run_bp(filename)
+	#run_gauss(filename)
+	run_bp(filename)
 
 
 
