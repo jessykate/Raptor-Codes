@@ -29,7 +29,7 @@ class RaptorManager:
 		self.debug = debug
 		self.f = open(filename, 'rb')
 		# number of symbols in each source block
-		self.K = K
+		self.K = int(K)
 		# keep a counter of how many blocks get sent out. 
 		self.current_block = 0
 		# remember how much padding the last block used 
@@ -59,36 +59,44 @@ class RaptorManager:
 			# if we reach the end of the file, get just the remaining bytes and
 			# pad the block as necessary
 			end_pos = self.f.tell()
+			print "started at post %d, reached EOF at pos %d" % (start_pos, end_pos)
 			remaining_bytes = end_pos - start_pos
 			self.f.seek(start_pos)
+			block = bitarray()
 			block.fromfile(self.f,remaining_bytes)
-			padding = self.K - remaining_bytes
+			padding = n - remaining_bytes
 			self.padding_last = padding
+			print "remaining bytes: %d, of required %d bits or %d bytes. current length = %d, ==> padding = %d" % (remaining_bytes, self.K, self.K/8, len(block), padding)
 			self.last_block = True
-			block.extend('0'*padding)
-		print len(block)
+			if padding*8 == self.K:
+				return None
+			else:
+				block.extend('0'*padding*8)
+		print "length of block is %d" % len(block)
+		print "self.K = %d" % self.K
 		assert len(block) == self.K
 		return block
 	
 	def generate_constraint_matrix(self, c, d):
 		# c is the number of constraint symbols.
 		# d is the density (remember LDPC is LOW density)
-		# construct a k x n matrix, where n = (k+c)
+		# construct a k x c matrix. because c is a constant and not from a
+		# distribution, this is considered a "regular" LDPC code. 
 		assert (0 < d < 1)
-		n = self.K + c
-		print "n = %d" % n
-		# given the size k x n, calculate the number of bits to make into 1s
-		# for the constraint matrix G. 
-		num_ones = int(n*self.K*d)
-		print "num ones = %d" % num_ones
-		# build G as long vector at first so it's easier to address specific
-		# bits, we'll reshape it below. 
-		G = numpy.zeros(self.K*n, int)
+		# given the size k x c, calculate the number of bits to make into 1s
+		# note the each of the c rows of the matrix G will form the (n-1)
+		# coefficients of a constraint symbol, where n is the number of ones
+		# present in the column, calculated as the product of the density term
+		# d and k. 
+		num_ones = int(c*self.K*d)
+		# build G as a long vector at first so it's easier to address specific
+		# bits. we'll reshape it below. 
+		G = numpy.zeros(self.K*c, int)
 		print "G matrix:"
 		print G
-		one_indices = random.sample(xrange(self.K*n), num_ones)
+		one_indices = random.sample(xrange(self.K*c), num_ones)
 		G[one_indices] = 1
-		G.shape = (self.K,n)
+		G.shape = (self.K,c)
 		# both the encoder and deocder need to know G
 		self.G = G
 		return G
@@ -116,9 +124,8 @@ class RaptorEncoder:
 		self.debug = debug
 		# symbols is a bitarray()
 		self.symbols = block
-		# generate matrix for pre-code, if any
-		self.G = numpy.asmatrix(G)
-		if self.debug: print "block has %d symbols"% len(self.symbols)
+		# generator matrix for pre-code, if any
+		self.G = G
 		# precoded is a bitarray()
 		self.intermediate = None
 
@@ -129,23 +136,35 @@ class RaptorEncoder:
 
 		# convert symbols to a numpy array for matrix multiplication
 		G_rows, G_cols = self.G.shape
-		print "symbols"
-		print self.symbols
-		k = numpy.array([self.symbols.tolist()])
-		print "precoding with generator matrix."
+		k = numpy.array(self.symbols.tolist())
+		print "precoding with generator matrix..."
 		print self.G
-		print "initial symbols"
-		print k
-		print k.shape
-		print self.G.shape
-		intermediate = numpy.asarray(k*self.G)[0,:]
-		print "intermediate symbols:"
-		print intermediate.shape
-		print intermediate
-		assert intermediate.shape == (G_cols,)
-		# return as bitarray
-		self.intermediate = intermediate
-		return bitarray(intermediate.tolist())
+		print "source symbols"
+		print self.symbols
+		# now here is the key: we must calculate the c redundant symbols z_i
+		# such that z_i xor G[:,i] = 0. 
+		z = numpy.array([], int)
+		for i in xrange(G_cols):
+			# sum([a,b,c...]) % 2 is equivalent to a^b^c^... 
+			coefficients = self.G[:,i]
+			print "coefficients"
+			print coefficients
+			other_terms = coefficients*k
+			print "other terms"
+			print other_terms
+			xor_other_terms = sum(other_terms) % 2
+			print "xor value of other terms: %d" % xor_other_terms
+			# we require xor_other_terms ^ zi = 0. this is true when zi has the
+			# same value as xor_other_terms. 
+			z = numpy.append(z, xor_other_terms)
+		# store as bitarray
+		self.z = bitarray(z.tolist())
+		self.intermediate = self.symbols + self.z
+		print "all intermediate symbols:"
+		print self.intermediate
+		print len(self.intermediate)
+		assert len(self.intermediate) == G_cols+len(k)
+		return self.intermediate
 	
 	def distribution_random_LT(self, num_symbols):
 		# return a vector of coefficient indices sampled from the contained
@@ -160,31 +179,29 @@ class RaptorEncoder:
 		return v
 
 	def generate_encoded(self):
+		if self.intermediate:
+			symbols = self.intermediate
+		else:
+			symbols = self.symbols
 
-		# distribution_fn must take as argument the number of symbols it is
-		# operating over, and return a vector of coefficients indices,
-		# sampled according to the distribution therein.
-		# example output for 10 precoded symbols: [2,4,9]
-		print self.intermediate
-		print len(self.intermediate)
-		v = self.distribution_random_LT(len(self.intermediate))
+		# the distribution fn must take as argument the number of symbols it is
+		# operating over, and return a vector of coefficients indices, sampled
+		# according to the distribution therein.  example output for 10
+		# precoded symbols: [2,4,9]
+		v = self.distribution_random_LT(len(symbols))
+		v.sort()
 
 		# grab the symbols at the index positions that have a 1 in the
 		# coefficient vector.
-		selected_symbols = [self.intermediate[idx] for idx in v]
+		selected_symbols = [symbols[idx] for idx in v]
 
 		# get the first two values to start the xor process (note this actually
 		# removes the values from selected_symbols, so after the for loop below
 		# selected_symbols will be in a wierd state and should not be used. 
-		if len(selected_symbols) == 1:
-			val = selected_symbols.pop()
-		else:
-			val = selected_symbols.pop()^selected_symbols.pop()
-			for val in selected_symbols:
-				val = val^val
+		xorval = sum(selected_symbols) % 2
 			
 		# return the xor'ed value and the associated coefficients
-		return {'val': val, 'coefficients': v}
+		return {'val': xorval, 'coefficients': v}
 
 class RaptorGaussDecoder:
 
@@ -194,6 +211,7 @@ class RaptorGaussDecoder:
 		self.A = numpy.array([], dtype=bool)
 		self.b = numpy.array([], dtype=bool)
 		self.blocks_received = 0
+		self.symbols_processed = 0
 
 	def add_block(self, encoded):
 		# increment number of blocks received either way
@@ -210,43 +228,33 @@ class RaptorGaussDecoder:
 				new_row[i] = 1
 			if i > max(coeff):
 				break
+		print "encoded block: " + str(new_row)
 
 		# compare it to the ones we've already received:
-		print "A is..."
-		print self.A
-		print "new row is..."
-		print new_row
 		duplicate = False
 		for row in self.A:
 			if numpy.all(row == new_row):
-				print "duplicate row, discarding..."
 				duplicate = True
 				break
 
 		if not duplicate:
-			print "not a duplicate, adding row."
 			# add the new row to the bottom
 			if not len(self.A):
 				self.A = numpy.array(new_row.tolist())
 			else:
 				self.A = numpy.vstack((self.A, numpy.array(new_row.tolist())))
 			self.b = numpy.append(self.b, val)
-		#raw_input()
 
 	def is_full_rank(self):
-		print "checking rank for current matrices [A b]"
 		if self.A.size == 0:
 			return False
 
 		b = numpy.array([self.b])
-		print b.shape
-		print self.A.shape
 		both = numpy.hstack((self.A,b.T))
 		rank_ab = numpy.linalg.matrix_rank(both)
 		rank_a = numpy.linalg.matrix_rank(self.A)
-		print "rank_ab = %d and rank_a = %d" % (rank_ab, rank_a)
 
-
+		'''
 		# print out list versions to copy over to matlab for sanity checking.
 		A = self.A.copy()
 		A = A.tolist()
@@ -257,13 +265,13 @@ class RaptorGaussDecoder:
 		print intA
 		intb = [int(bb) for bb in self.b.tolist()]
 		print intb
-
-		if (rank_ab > rank_a) or (rank_ab < self.K):
-			return False
-		return True
-
-	def get_rank(self):
-		return numpy.linalg.matrix_rank(self.A)
+		'''
+		if rank_ab == rank_a and rank_ab == self.K:
+			print "rank_ab = rank_a = %d" % rank_ab
+			print "matrix is full rank."
+			return True
+		print "rank_ab = %d, != rank_a = %d" % (rank_ab, rank_a)
+		return False
 
 	def num_blocks(self):
 		# how many encoded blocks have we received so far?
@@ -304,7 +312,7 @@ class RaptorGaussDecoder:
 		b = numpy.array([self.b])
 		mat = numpy.hstack((self.A,b.T))
 		tri, b = self._triangularize(mat)
-		self._backsub(tri, b)
+		return self._backsub(tri, b)
 
 	def _backsub(self, tri, b):
 		mat = numpy.hstack((tri, numpy.array([b]).T))
@@ -312,27 +320,23 @@ class RaptorGaussDecoder:
 		soln = numpy.zeros(cols, int)
 		# initialize solution vector with RHS of last row
 		for i in (xrange(cols)).__reversed__():
-			# the reason for the second term being 1 is that the row in
-			# question always has a 1 at the diagonal
-			#inner_term = (sum(mat[i,i:cols] * soln[i:cols]) + mat[i,1]) % 2
+			# the second term is always a 1 since the row in question always
+			# has a 1 at the diagonal
 			inner_term = (numpy.dot(mat[i,i:cols],soln[i:cols]) + mat[i,-1]) % 2
-			print "inner term mod 2"
-			print inner_term
 			soln[i] = numpy.logical_and(inner_term, 1)
-			print "soln for x" + str(i)+" = " + str(soln[i])
-
+			#print "soln for x" + str(i)+" = " + str(soln[i])
+		
+		return soln
 		# verify solution:
-		print mat
-		print "computed solution:"
-		print soln
+		#print mat
+		#print "computed solution:"
+		#print soln
 
 	def _triangularize(self, mat):
 
 		#mat = self.remove_null_rows(mat)
 		#mat = self.remove_duplicate_rows(mat)
-		print "starting triangularize..."
 		rows, cols = mat.shape
-		print mat
 		# we tacked the solution vector onto the end of the matrix, so don't
 		# count it in terms of the number of columns to iterate over. 
 		cols = cols -1
@@ -378,8 +382,6 @@ class RaptorGaussDecoder:
 		# now we can get rid of the dangling rows since our solution is
 		# uniquely specified by the top square component. 
 		mat = mat[0:cols,:]
-		print "rank is now"
-		print numpy.linalg.matrix_rank(mat)
 
 		return mat[:, 0:cols], mat[:, -1]
 
@@ -403,102 +405,107 @@ class RaptorGaussDecoder:
 class RaptorBPDecoder:
 	
 	def __init__(self, K, G=None):
-		# num symbols per block
+		# actual data symbols per block
 		self.K = K
 		# constraint matrix
 		self.G = G
-		self.constraint_symbols = self.G.shape[1] - self.K
 		# BP decoder bookkeeping
 		self.symbols_processed = 0
+		# keep track of how many xor operations have been performed (does not
+		# account for looping over lists since these could be optimized out in
+		# a more legit implementation)
+		self.symbol_operations = 0
+		# the number of columns of G is the number of constraint symbols, which
 		self.known_symbols = {}
 		self.waiting_symbols = []
+		if self.G != None:
+			self.constraint_symbols = self.G.shape[1] - self.K
+			self.prime()
+		else:
+			self.constraint_symbols = 0
 
-	def de_precode(self, intermediate):
+	def prime(self):
+		# "prime" the decoding pump by filling in the info we already know. 
 		# if pre-coding was used, then the symbols decoded by the BP decoder
-		# include redundant 'constraint' symbols that we need to remove to get
-		# back the original source symbols. 
+		# include redundant 'constraint' symbols that give information. 
 
-		# make a matrix out of the remaining waiting symbols
-		# we know that x*G = int, and int*A = y ==> x*G*A = y.
-		# so x = y*A_inv*G_inv
-		# we have G and y (all the vals) and A (coeffs)
+		# we know that for the constraint symbols, there are redundant blocks
+		# such that xor of coeffs*(x1,x2,...xn) = 0. we have those coeffs
+		# already, they are the values of the corresponding columns in G
 
-		# use gauss elimination to find multiplication of G with
-		pass
-
+		constraint_symbols = self.G.shape[1]
+		print "there are %d constraint symbols" % constraint_symbols
+		for i in xrange(constraint_symbols):
+			coeffs = self.G[:,i].nonzero()[0]
+			coeffs = numpy.append(coeffs, self.K+i)
+			zi = {'coeffs': coeffs.tolist(), 
+					'xor_val': 0,
+					}
+			print zi
+			self.waiting_symbols.append(zi)
+		print "constraint symbols are"
+		print self.waiting_symbols
 
 
 	def bp_decode(self, block):
 		self.symbols_processed += 1
 		val = bool(block['val'])
 		coeffs = block['coefficients']
-		if len(coeffs) > 1:
-			self.reduce(coeffs, val)	
+		resolved = []
+		
+		# add the symbol either to the known list if it's of length one, or to
+		# the waiting list otherwise. then process the known list against the
+		# waiting list. 
+
 		if len(coeffs) == 1:
-			self.process_degree_one(coeffs, val)
+			print "degree one!"
+			print block
+			if not coeffs[0] in self.known_symbols.keys():
+				self.known_symbols[coeffs[0]] = val
+		else:
+			print "no such luck. processing..."
+			self.waiting_symbols.append({'coeffs': coeffs, 'xor_val': val})
+		
+		# XXX this is VERY inefficient, but simple. we're not dealing with huge
+		# files and not measuring decoding speed, but are measuring symbol
+		# overhead, so it's more important to get this right than fast. 
+		keep_processing = True
+		while keep_processing:
+			# initialize to false each time through the loop. set to true only
+			# if there's a new symbol released. 
+			keep_processing = False
+			# always iterate over the known symbols
+			new_known = []
+			for known_c, known_v in self.known_symbols.iteritems():
+				resolved = []
+				for item in self.waiting_symbols: 
+					if known_c in item['coeffs']:
+						item['xor_val'] = item['xor_val'] ^ known_v
+						self.symbol_operations += 1
+						item['coeffs'].remove(known_c)
+					if len(item['coeffs']) == 1:
+						keep_processing = True
+						resolved.append(item)
+				self.waiting_symbols = [item for item in self.waiting_symbols if not item in resolved]
+				new_known.extend(resolved)
+			for item in new_known:
+				if item['coeffs'][0] not in self.known_symbols.keys():
+					self.known_symbols[item['coeffs'][0]] = item['xor_val']
 
-		if self.symbols_processed >= self.K + self.constraint_symbols:
-			# then we should have enough symbols to decode using the precode
+		print "state of the BP:"
+		print "known symbols"
+		print self.known_symbols
+		print "still waiting symbols"
+		print self.waiting_symbols
 
-
-
-		if len(self.known_symbols) == self.K:
+		# need the known symbols to be the original k, not (just) the
+		# constraint symbols.
+		recovered_originals = [k for k in self.known_symbols if k in range(self.K)]
+		if len(recovered_originals) == self.K:
 			print self.known_symbols
 			# return symbols as a bitarray
-			return bitarray(self.known_symbols.values())
+			return bitarray(self.known_symbols.values()[0:self.K])
 		else: return None
-
-	def process_degree_one(self,coeff, val):
-		self.note_resolved(coeff, val)
-		new_resolved = self.match_against_queue(coeff, val)
-		while len(new_resolved) > 0:
-			new_resolved_copy = new_resolved.copy()
-			addtl_resolved = []
-			for r in new_resolved_copy:
-				self.note_resolved(r['coeffs'][0], r['val'])
-				addtl = self.match_against_queue(r['coeffs'][0], r['val'])
-				if len(addtl) > 0:
-					addtl_resolved.append(addtl)
-			new_resolved = addtl_resolved
-
-	def match_against_queue(self,resolved_coeff, resolved_val):
-		new_resolved = []
-		for w in self.waiting_symbols:
-			if resolved_coeff in w['coeffs']:
-				w['xor_val'] = w['xor_val'] ^ resolved_val
-				w['coeffs'].remove(resolved_coeff)
-			if len(w['coeffs']) == 1:
-				new_resolved.append(w)
-		for r in new_resolved:
-			self.waiting_symbols.delete(r)
-		return new_resolved
-
-	def note_resolved(self, coeff, val):
-		assert len(coeff) == 1
-		if not coeff[0] in self.known_symbols.keys():
-			self.known_symbols[coeff[0]] = val
-
-	def queue_append(self, coeff, val):
-		self.waiting_symbols.append({
-			'degree': len(coeff),
-			'coeffs': coeff,
-			'xor_val': val
-		})
-
-	def reduce(self, coeffs, val):
-		resolved = []
-		for c in coeffs:
-			if c in self.known_symbols.keys():
-				# xor the known value into the 'data' portion (the xor'ed
-				# value)
-				val = val ^ self.known_symbols[c]
-				resolved.append(c)
-		# remove the resolved coefficients
-		coeff = [c for c in coeffs if not c in resolved]
-		if len(coeffs) == 1:
-			self.process_degree_one(coeffs, val)
-		else:
-			self.queue_append(coeffs, val)
 
 def run_gauss(filename):
 	DEBUG = True
@@ -509,69 +516,93 @@ def run_gauss(filename):
 	epsilon = int(0.5*8)
 	manager = RaptorManager(filename, K)
 	block = manager.next_block()
-	if DEBUG: 
-		print "retrieved block... "
-		print block
-	# this encoder is non-systematic, uses no pre-code. 
-	encoder = RaptorEncoder(block)
-	decoder = RaptorGaussDecoder(K)
+	decoded_blocks = []
+	processed_blocks = 0
+	output_blocks = 0
+	while block:
+		output_blocks += 1
+		print "-----------------------------"
+		print "block %d" % output_blocks
+		if DEBUG: 
+			print "encoding original (source) block: " + str(block)
+		# this encoder is non-systematic and uses no pre-code. 
+		encoder = RaptorEncoder(block)
+		decoder = RaptorGaussDecoder(K)
 
-	# grab new symbols and periodically check to see if we've gathered enough
-	# to find a solution. when the decoder matrix is full rank, try and solve
-	# for the original symbols. 
-	while not decoder.is_full_rank():
-		print "not full rank yet, continuing..."
-		for i in xrange(K+epsilon):
-			e = encoder.generate_encoded()
-			decoder.add_block(e)
+		# grab new symbols and periodically check to see if we've gathered enough
+		# to find a solution. when the decoder matrix is full rank, try and solve
+		# for the original symbols. 
+		while not decoder.is_full_rank():
+			for i in xrange(K+epsilon):
+				e = encoder.generate_encoded()
+				decoder.add_block(e)
 
-	print "attempting to solve after " + str(decoder.blocks_received) + " blocks."
-	decoder.decode_gauss_base2()
-	
-	#print decoder.convert()
-	print "original block"
-	print block
+		print "attempting to solve after " + str(decoder.blocks_received) + " blocks."
+		original_block = decoder.decode_gauss_base2()
+		print "decoded block was..."
+		print original_block
 
-def run_bp(filename):
+		decoded_blocks.append(original_block)
+		processed_blocks += decoder.symbols_processed
+		block = manager.next_block()
+
+	print "decoder processed %d output blocks after %d received blocks. A total of factor of %d average overhead" % (output_blocks, processed_blocks, processed_blocks/float(output_blocks))
+	print "decoded blocks:"
+	print decoded_blocks
+	print "decoded message"
+	for d in decoded_blocks:
+		sys.stdout.write(d.tostring())
+	print ""
+
+def run_bp(filename, precode, K, c, d):
 	DEBUG = True
 
-	# if we want everything to go in one block, then use len(data) as the block
-	# length
-	K = 8
-	epsilon = int(0.5*8)
 	manager = RaptorManager(filename, K)
-	G = manager.generate_constraint_matrix(c=3,d=0.2)
+	if precode:
+		G = manager.generate_constraint_matrix(c,d)
+	else:
+		G = None
 
 	decoded_blocks = []
-	total_overhead = 0
+	processed_blocks = 0
+	source_blocks = 0
+	symops = 0
 	block = manager.next_block()
 	while block:
+		source_blocks += 1
 		print "next block... "
 		print block
-		# this encoder is non-systematic, uses no pre-code. 
-		# XXX it's also weird that there's one encoder per block but one
-		# manager and decoder per message. fix. 
-		encoder = RaptorEncoder(block,G)
+		# this encoder is non-systematic
+		encoder = RaptorEncoder(block, G)
 		decoder = RaptorBPDecoder(K, G)
-		intermediate = encoder.ldpc_precode()
+		if precode:
+			# precoding happens only once per block
+			intermediate = encoder.ldpc_precode()
 
 		original_symbols = False
 		while not original_symbols:
 			e = encoder.generate_encoded()
-			#print "\n--- NEW encoded block"
-			#print e
 			original_symbols = decoder.bp_decode(e)
 		print block
-		print "%d symbols processed for this block for %d source symbols." % (decoder.symbols_processed, K)
+		print "%d blocks processed for this block of %d source symbols." % (decoder.symbols_processed, K)
 		decoded_blocks.append(original_symbols)
+		symops += decoder.symbol_operations
+		processed_blocks += decoder.symbols_processed
 		block = manager.next_block()
+		print "for this round, 1 source block was processed after receiving %d encoded blocks." % decoder.symbols_processed
 	
-	total_overhead = decoder.symbols_processed
-	print "decoder processed %d blocks with %f%% average overhead" % (len(decoded_blocks), 100*total_overhead/float(len(decoded_blocks)))
-	print "original message was"
+	overhead = (processed_blocks/float(source_blocks))
+	print "%d output blocks" % source_blocks
+	print "%d received blocks." % processed_blocks
+	print "overhead: %d" % overhead
+
+	print "decoded blocks:"
 	print decoded_blocks
+	print "decoded message"
 	for d in decoded_blocks:
 		sys.stdout.write(d.tostring())
+	print ""
+	return {'K': K, 'precode':precode, 'c':c, 'd':d, 'source':source_blocks, 'processed': processed_blocks, 'overhead': overhead, 'symops': symops}
 
 	
 if __name__ == '__main__':
@@ -580,7 +611,22 @@ if __name__ == '__main__':
 		sys.exit(1)
 	filename = sys.argv[1]
 	#run_gauss(filename)
-	run_bp(filename)
+	precode_results = []
+	noprecode_results = []
+	for K in xrange(8,40,8):
+		noprecode_results.append(run_bp(filename, precode=False, K=K, c=None, d=None))
+		precode_results.append(run_bp(filename, precode=True, K=K, c=3, d=0.2))
+
+	print "Non precoded results"
+	for r in noprecode_results:
+		print "K: %d. Avg Overhead: %f. Symbol Operations: %d" % (r['K'], r['overhead'], r['symops'])
+		print ""
+	print "\n"
+	
+	print "Precoded results"
+	for r in precode_results:
+		print "K: %d. Avg Overhead: %f. Symbol Operations: %d" % (r['K'], r['overhead'], r['symops'])
+		print ""
 
 
 
